@@ -1,4 +1,5 @@
 import os
+import re
 import paddle
 from safetensors.numpy import load_file
 from safetensors.torch import save_file as save_safetensors
@@ -40,7 +41,6 @@ def convert_pdparams_to_safetensors(pdparams_path, safetensors_path, config):
     """
     print("----------------------------------------------------------------")
     print("pdparams_path:", pdparams_path)
-    paddle.set_device('cpu')
     # Load the PaddlePaddle model state dictionary
     torch_state_dict = {}
     weight_map = {}
@@ -48,20 +48,19 @@ def convert_pdparams_to_safetensors(pdparams_path, safetensors_path, config):
     for key, param in pd_tensors.items():
         if param.dtype != 'float32':
             param = (param.astype(np.uint32) << 16).view(np.float32)
-        if key.endswith('.weight') and \
+        if (key.endswith('.weight') or key.endswith('.weight_1')) and \
             "embed_tokens" not in key and \
-            ".gate." not in key and \
             param.ndim == 2:
             param = param.T  # Transpose the parameter
-        # vision model参数为float16
         tensor = torch.from_numpy(param)
-        if 'vision' in key:
-            tensor = tensor.to(torch.float16)
-        elif 'mlp.gate.weight' not in key and 'mlp.moe_statics.e_score_correction_bias' not in key:
+        if 'mlp.gate.weight' not in key and 'mlp.moe_statics.e_score_correction_bias' not in key:
             tensor = tensor.to(torch.bfloat16)
 
-        key = key.replace('ernie.', 'model.')
-        if 'vision' not in key:
+        key = re.sub("^vision_model", "vision_tower", key)
+        key = re.sub("^ernie", "language_model", key)
+        key = re.sub("^language_model.resampler_model", "resampler_model", key)
+        key = "model." + key
+        if 'vision_tower' not in key:
             if 'qkv_proj' in key:
                 N, D = tensor.shape
                 num_heads = config['num_attention_heads']
@@ -80,46 +79,71 @@ def convert_pdparams_to_safetensors(pdparams_path, safetensors_path, config):
                 torch_state_dict[key.replace('qkv_proj', 'q_proj')] = q_proj.contiguous()
                 torch_state_dict[key.replace('qkv_proj', 'k_proj')] = k_proj.contiguous()
                 torch_state_dict[key.replace('qkv_proj', 'v_proj')] = v_proj.contiguous()
-            elif 'up_gate_proj' in key:
-                fused_dim, hidden_size = tensor.shape
-                # auto infer intermediate_size
-                assert fused_dim % 2 == 0, f"Cannot split tensor with odd dimension {fused_dim}. \
-                    Specify intermediate_size."
-                intermediate_size = fused_dim // 2
+            elif 'mlp' in key:
+                if "moe_statics" in key:
+                    suffix = "moe_statics.e_score_correction_bias"
+                    converted_key = key.removesuffix(suffix)
+                    # splitting param (2, ...) to 2 * (1, ...)
+                    torch_state_dict[converted_key + "text_moe." + suffix] = tensor[0][None, :].contiguous()
+                    torch_state_dict[converted_key + "vision_moe." + suffix] = tensor[1][None, :].contiguous()
+                elif "gate.weight" in key:
+                    moe_type = "text_moe"
+                    if "weight_1" in key:
+                        moe_type = "vision_moe"
+                    suffix = "gate.weight"
+                    converted_key = key.removesuffix("_1")  # vision
+                    converted_key = converted_key.removesuffix("gate.weight")
+                    torch_state_dict[converted_key + f"{moe_type}." + suffix] = tensor.contiguous()
+                elif ".experts" in key:
+                    moe_type = "text_moe"
+                    expert_number = int(re.findall(r'\d+', key)[-1])
+                    # 128 experts split into 64 each (text, vision)
+                    if expert_number >= 64:
+                        moe_type = "vision_moe"
+                        expert_number -= 64
+                    # avoid subbing the layer idx + experts twice
+                    prefix = re.findall(r'model.language_model.layers.\d+.mlp.experts.', key)[0]
+                    converted_key = re.sub(r"\d+", f"{moe_type}.experts.{expert_number}", key.removeprefix(prefix))
+                    full_key = re.sub(".experts", "", prefix) + converted_key
+                    if 'up_gate_proj' in full_key:
+                        fused_dim, hidden_size = tensor.shape
+                        # auto infer intermediate_size
+                        assert fused_dim % 2 == 0, f"Cannot split tensor with odd dimension {fused_dim}. \
+                            Specify intermediate_size."
+                        intermediate_size = fused_dim // 2
 
-                assert (
-                    fused_dim == 2 * intermediate_size
-                ), f"Tensor shape {tensor.shape} does not match 2 * intermediate_size {2 * intermediate_size}"
+                        assert (
+                            fused_dim == 2 * intermediate_size
+                        ), f"Tensor shape {tensor.shape} does not match 2 * intermediate_size {2 * intermediate_size}"
 
-                gate_proj, up_proj = torch.split(tensor, [intermediate_size, intermediate_size], dim=0)
-                torch_state_dict[key.replace('up_gate_proj', 'gate_proj')] = gate_proj.contiguous()
-                torch_state_dict[key.replace('up_gate_proj', 'up_proj')] = up_proj.contiguous()
+                        gate_proj, up_proj = torch.split(tensor, [intermediate_size, intermediate_size], dim=0)
+                        torch_state_dict[full_key.replace('up_gate_proj', 'gate_proj')] = gate_proj.contiguous()
+                        torch_state_dict[full_key.replace('up_gate_proj', 'up_proj')] = up_proj.contiguous()
+                    else:
+                        torch_state_dict[full_key] = tensor.contiguous()
+                elif 'up_gate_proj' in key:
+                    fused_dim, hidden_size = tensor.shape
+                    # auto infer intermediate_size
+                    assert fused_dim % 2 == 0, f"Cannot split tensor with odd dimension {fused_dim}. \
+                        Specify intermediate_size."
+                    intermediate_size = fused_dim // 2
+
+                    assert (
+                        fused_dim == 2 * intermediate_size
+                    ), f"Tensor shape {tensor.shape} does not match 2 * intermediate_size {2 * intermediate_size}"
+
+                    gate_proj, up_proj = torch.split(tensor, [intermediate_size, intermediate_size], dim=0)
+                    torch_state_dict[key.replace('up_gate_proj', 'gate_proj')] = gate_proj.contiguous()
+                    torch_state_dict[key.replace('up_gate_proj', 'up_proj')] = up_proj.contiguous()
+                else:
+                    torch_state_dict[key] = tensor.contiguous()
+            elif "lm_head" in key:
+                torch_state_dict["lm_head"] = tensor.contiguous()
             else:
                 torch_state_dict[key] = tensor.contiguous()
         else:
             torch_state_dict[key] = tensor.contiguous()
-    # Save the state_dict as a .safetensors file
-    save_safetensors(torch_state_dict, safetensors_path)
-
-def split_index(index):
-    new_weight_map = {}
-    for k, v in index['weight_map'].items():
-        k = k.replace('ernie.', 'model.')
-        if 'vision' not in k:
-            if 'qkv_proj' in k:
-                new_weight_map[k.replace('qkv_proj', 'q_proj')] = v
-                new_weight_map[k.replace('qkv_proj', 'k_proj')] = v
-                new_weight_map[k.replace('qkv_proj', 'v_proj')] = v
-            elif 'up_gate_proj' in k:
-                new_weight_map[k.replace('up_gate_proj', 'gate_proj')] = v
-                new_weight_map[k.replace('up_gate_proj', 'up_proj')] = v
-            else:
-                new_weight_map[k] = v
-        else:
-            new_weight_map[k] = v
-    index['weight_map'] = new_weight_map
-
-    return index
+    return torch_state_dict
 
 def convert_multiple_pdparams_to_safetensors(input_dir, output_dir):
     """
@@ -129,23 +153,34 @@ def convert_multiple_pdparams_to_safetensors(input_dir, output_dir):
         output_dir (str): Directory to save .safetensors files.
     """
     if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+    # indexing base dict
+    index_dict = {"metadata": {"total_size": 0}, "weight_map": {}}
 
     with open(os.path.join(input_dir, 'config.json'), 'r', encoding='utf-8') as f:
         config = json.load(f)
 
     with open(os.path.join(input_dir, 'model.safetensors.index.json'), 'r', encoding='utf-8') as f:
         index = json.load(f)
-    index = split_index(index)
-    with open(os.path.join(output_dir, 'model.safetensors.index.json'), 'w', encoding='utf-8') as f:
-        json.dump(index, f, indent=2)
+    index_dict["metadata"] = index["metadata"]
 
     for filename in sorted(os.listdir(input_dir)):
         if filename.endswith('.safetensors'):
             pdparams_path = os.path.join(input_dir, filename)
             safetensors_path = os.path.join(output_dir, filename)
-            convert_pdparams_to_safetensors(pdparams_path, safetensors_path, config)
+            torch_state_dict = convert_pdparams_to_safetensors(pdparams_path, safetensors_path, config)
+            save_safetensors(torch_state_dict, safetensors_path)
+
+            # remap namings in index
+            for k in torch_state_dict.keys():
+                index_dict["weight_map"][k] = filename
+
             print(f"Converted {filename} to {safetensors_path}")
+    
+    # save index
+    with open(os.path.join(output_dir, 'model.safetensors.index.json'), 'w', encoding='utf-8') as f:
+        json.dump(index_dict, f, indent=2)
 
 # Example usage
 if __name__ == "__main__":
