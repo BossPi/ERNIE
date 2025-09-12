@@ -329,7 +329,7 @@ class UtteranceProcessor(ProcessorBase):
                         asr_one[1], asr_one[2] = float(asr_one[1]), float(asr_one[2])
 
                 if not self.is_pretraining:
-                    vid_id = len(schema_new["video_info"])
+                    vid_id = len(schema_new["video_info"]) + 1
                     element = {"text": f"Video {vid_id}:", "tag": "mask"}
                     schema_new["text_info"].append(element)
                     add_item_to_order(

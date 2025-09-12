@@ -278,6 +278,13 @@ class ExampleToFeature(ProcessorBase):
             data_types = [item["image_type"] for item in meta["image_info"]]
             if len(set(data_types)) == 1:
                 dataset_type = "default" if data_types[0] == "image" else data_types[0]
+            else:
+                assert (
+                    len(set(data_types)) == 2
+                    and "image" in data_types
+                    and "video" in data_types
+                ), f"Unknow data types: {set(data_types)}."
+                dataset_type = "video"
         dataset_name = self.data_info["dataset_name"]
         data_type = DATASET_TYPE_TO_DATA_TYPE.get(dataset_type, None)
         assert data_type is not None, f"Unknow dataset type: {dataset_type}."
