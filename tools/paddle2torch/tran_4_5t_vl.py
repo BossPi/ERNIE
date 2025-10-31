@@ -195,6 +195,19 @@ def convert_pdparams_to_safetensors(pdparams_path, safetensors_path, config):
                     torch_state_dict[key] = tensor.contiguous()
             elif "lm_head" in key:
                 torch_state_dict["lm_head"] = tensor.contiguous()
+            elif "spatial_linear" in key or "temporal_linear" in key:
+                sequential_number = int(re.findall(r"\d+", key)[-1])
+
+                if sequential_number == 0:
+                    converted_key = re.sub(r"(?<=\.)\d+(?=\.)", "fc1", key)
+                elif sequential_number == 2:
+                    converted_key = re.sub(r"(?<=\.)\d+(?=\.)", "fc2", key)
+                elif sequential_number == 3:
+                    converted_key = re.sub(r"(?<=\.)\d+(?=\.)", "ln", key)
+                else:
+                    converted_key = key
+
+                torch_state_dict[converted_key] = tensor.contiguous()
             else:
                 torch_state_dict[key] = tensor.contiguous()
         else:
